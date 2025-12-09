@@ -1,407 +1,565 @@
 #!/usr/bin/env python3
-"""OxyReport: multi-target Telegram reporting utility."""
+"""Premium-style Telegram bot with interactive menus and admin tooling.
+
+This file rewrites the former Termux utility into a fully asynchronous,
+button-driven Telegram bot powered by ``python-telegram-bot``. The bot ships
+with:
+- Reply and inline keyboard navigation similar to popular moderation bots
+- Inline query support
+- Auto-response and basic moderation hooks
+- Persistent JSON-based storage for user preferences and audit logs
+- Admin-only commands for privileged flows
+
+Environment variable required: ``BOT_TOKEN`` for the bot's HTTP API token.
+Update ``ADMIN_USER_IDS`` to match the accounts that should access admin-only
+commands.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import datetime
-import re
-import sys
-from typing import Dict, List
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from functools import wraps
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Iterable, List
 
-from pyrogram import Client
-from pyrogram.errors import BadRequest, FloodWait, RPCError, SessionPasswordNeeded, UserNotParticipant
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    AIORateLimiter,
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    InlineQueryHandler,
+    MessageHandler,
+    filters,
+)
 
-from report import report_profile_photo, send_report
+DATA_DIR = Path("data")
+PREFS_FILE = DATA_DIR / "user_prefs.json"
+AUDIT_FILE = DATA_DIR / "audit_log.json"
+LOG_FILE = DATA_DIR / "bot.log"
 
-DEVELOPER_SIGNATURE = "@oxeign"
-DEFAULT_REPORT_COUNT = 5000
-
-REPORT_REASONS: Dict[str, str] = {
-    "1": "Spamming and Unwanted Content",
-    "2": "Child Abuse and Nudity",
-    "3": "Pornography and Explicit Material",
-    "4": "Promoting Violence and Gore",
-    "5": "Illegal Drug Sales and Activity",
-    "6": "Hate Speech and Discrimination",
-    "7": "Copyright and Intellectual Property Infringement",
-    "8": "Impersonation and Scams",
-    "9": "Other (Custom Text Required)",
-}
-
-REASON_CODE_MAP: Dict[str, int] = {
-    "1": 0,
-    "2": 3,
-    "3": 2,
-    "4": 1,
-    "5": 5,
-    "6": 5,
-    "7": 4,
-    "8": 5,
-    "9": 5,
-}
-
-TOTAL_SENT = 0
-STOP_EVENT = asyncio.Event()
+ADMIN_USER_IDS: tuple[int, ...] = ()  # Populate with real admin Telegram user IDs
 
 
-def parse_url(url: str) -> Dict[str, object]:
-    """Parse a Telegram URL and classify the target type."""
-    url = url.strip()
-    result: Dict[str, object] = {"type": "unknown", "entity_id": None, "message_id": None}
+@dataclass
+class UserPreferences:
+    """Simple user preference payload stored per user ID."""
 
-    msg_match = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/(c/)?([^/]+)/([0-9]+)", url)
-    if msg_match:
-        is_c_group = msg_match.group(1)
-        part = msg_match.group(2)
-        message_id = int(msg_match.group(3))
-        result.update({"type": "message", "message_id": message_id})
+    auto_reply: bool = True
+    moderation_enabled: bool = True
 
-        if is_c_group == "c/":
-            result["entity_id"] = int(f"-100{part}") if part.isdigit() else f"-100{part}"
-        elif part.isdigit():
-            result["entity_id"] = int(part)
-        else:
-            result["entity_id"] = part
-        return result
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "auto_reply": self.auto_reply,
+            "moderation_enabled": self.moderation_enabled,
+        }
 
-    invite_match = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/(joinchat/[^/?#]+|\+[^/?#]+)", url)
-    if invite_match:
-        entity = invite_match.group(1)
-        result.update({"type": "invite", "entity_id": entity})
-        return result
-
-    chat_match = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/([^/]+)/?$", url)
-    if chat_match:
-        entity = chat_match.group(1)
-        if entity.startswith("+") or entity.startswith("joinchat/"):
-            result.update({"type": "invite", "entity_id": entity})
-        elif entity.isdigit() or entity.startswith("-100"):
-            result.update({"type": "chat", "entity_id": int(entity) if entity.isdigit() else entity})
-        else:
-            result.update({"type": "profile", "entity_id": entity})
-        return result
-
-    raise ValueError("Invalid Telegram URL format.")
-
-
-async def join_private_group(client: Client, invite_link: str):
-    """Attempt to join a private group/channel using the provided invite link."""
-    try:
-        joined = await client.join_chat(invite_link)
-        chat_id = getattr(joined, "id", None) or getattr(joined, "chat_id", None)
-        if chat_id is None:
-            chat_id = getattr(joined, "username", None) or getattr(joined, "title", None) or invite_link
-        print(f"[{client.name}] Successfully joined the private chat via invite link: {chat_id}")
-        return chat_id
-    except UserNotParticipant:
-        print(f"[{client.name}] Failed to join. Invalid invite link or access denied.")
-        return None
-    except Exception as exc:
-        print(f"[{client.name}] Error during group join attempt: {exc}")
-        return None
-
-
-async def verify_target(client: Client, target: Dict[str, object]) -> bool:
-    """Verify the target exists (used for message targets)."""
-    if target["type"] != "message":
-        return True
-
-    try:
-        message = await client.get_messages(target["entity_id"], message_ids=target["message_id"])
-        if not message:
-            print(f"Verification: message not found {target['entity_id']}/{target['message_id']}")
-            return False
-        return True
-    except Exception as exc:
-        print(f"Verification failed for {target['entity_id']}/{target['message_id']}: {exc}")
-        return False
-
-
-async def multi_target_report_worker(
-    client: Client,
-    target_urls: List[Dict[str, object]],
-    reason_int: int,
-    reason_text: str,
-    total_target: int,
-    session_name: str,
-) -> None:
-    """Worker loop for each session string."""
-    global TOTAL_SENT
-
-    target_index = 0
-    num_targets = len(target_urls)
-
-    while not STOP_EVENT.is_set():
-        if TOTAL_SENT >= total_target:
-            break
-
-        target = target_urls[target_index % num_targets]
-        target_index += 1
-
-        entity_id = target["entity_id"]
-        msg_id = target.get("message_id")
-        target_type = target["type"]
-
-        try:
-            success = False
-            if target_type == "message":
-                success = await send_report(client, entity_id, msg_id, reason_int, reason_text)
-            elif target_type in ("profile", "chat", "invite"):
-                success = await report_profile_photo(client, entity_id, reason_int, reason_text)
-
-            if success:
-                TOTAL_SENT += 1
-                print(f"[{TOTAL_SENT}/{total_target}] Sent {target_type.upper()} Report for {entity_id} via {session_name}")
-            else:
-                await asyncio.sleep(1)
-
-        except FloodWait as exc:
-            wait_seconds = getattr(exc, "value", None) or getattr(exc, "x", None) or 30
-            print(f"[{session_name}] ⚠️ FloodWait hit! Sleeping for {wait_seconds} seconds.")
-            await asyncio.sleep(wait_seconds)
-        except BadRequest as exc:
-            print(f"[{session_name}] ❌ Stop Signal: Fatal Request Error. ({exc})")
-            STOP_EVENT.set()
-            break
-        except RPCError as exc:
-            print(f"[{session_name}] ⚠️ RPC Error: {exc}. Retrying in 3s.")
-            await asyncio.sleep(3)
-        except Exception as exc:
-            print(f"[{session_name}] ❌ Generic Error: {exc}. Retrying in 1s.")
-            await asyncio.sleep(1)
-
-        await asyncio.sleep(0.05)
-
-
-def prompt_api_credentials():
-    while True:
-        api_id_raw = input("Enter API ID (Mandatory): ").strip()
-        if api_id_raw and api_id_raw.isdigit():
-            api_id = int(api_id_raw)
-            break
-        print("API ID must be a number and cannot be empty.")
-
-    while True:
-        api_hash = input("Enter API HASH (Mandatory): ").strip()
-        required_len = 5 + len(DEVELOPER_SIGNATURE)
-        if api_hash and len(api_hash) >= required_len:
-            break
-        print(f"Invalid API Hash. Hash length must be at least {required_len} characters.")
-
-    return api_id, api_hash
-
-
-def prompt_sessions() -> List[str]:
-    sessions: List[str] = []
-    print("\n--- Session Entry ---")
-    print("Enter at least one session string.")
-    while True:
-        sess_str = input(f"Enter Session String #{len(sessions) + 1}: ").strip()
-        if sess_str:
-            sessions.append(sess_str)
-            print(f"Session #{len(sessions)} added.")
-
-        if sessions:
-            choice = input("Add another session? (y/n): ").strip().lower()
-            if choice == "n":
-                break
-        elif not sess_str:
-            print("No session entered.")
-            break
-    return sessions
-
-
-async def prompt_targets(clients: List[Client]) -> List[Dict[str, object]]:
-    target_urls: List[Dict[str, object]] = []
-
-    print("\n--- Target URL Entry ---")
-    print("Enter up to 5 Telegram URLs (Messages, Profiles, Public/Private Chats).")
-    for i in range(1, 6):
-        url_input = input(f"Enter Target URL #{i} (or press Enter to finish): ").strip()
-        if not url_input:
-            if i == 1:
-                print("At least one URL is required.")
-                continue
-            break
-
-        try:
-            parsed_target = parse_url(url_input)
-            if parsed_target["type"] == "invite":
-                print(f"Detected potential private group/invite link: {url_input}")
-                invite_link = input("-> Please enter the FULL INVITE LINK (+ABCxyz or joinchat/...): ").strip()
-
-                if invite_link:
-                    print("Attempting to join the private chat...")
-                    joined_chat_id = await join_private_group(clients[0], invite_link)
-                    if joined_chat_id:
-                        parsed_target["entity_id"] = joined_chat_id
-                        parsed_target["type"] = "chat"
-                    else:
-                        print("Failed to join the chat. Skipping this URL.")
-                        continue
-                else:
-                    print("Invite link not provided. Skipping this URL.")
-                    continue
-
-            target_urls.append(parsed_target)
-        except Exception as exc:
-            print(f"Invalid URL entered: {exc}. Please try again.")
-
-    return target_urls
-
-
-def prompt_reason_and_description():
-    while True:
-        print("\nSelect Report Reason (Mandatory):")
-        for code, reason in REPORT_REASONS.items():
-            print(f"  [{code}] {reason}")
-        reason_code = input("Select Option: ").strip()
-        if reason_code in REPORT_REASONS:
-            break
-        print("Invalid option selected.")
-
-    while True:
-        reason_text = input("Enter Report Description (Mandatory): ").strip()
-        if reason_text:
-            break
-        print("Description cannot be empty.")
-
-    mapped_reason_int = REASON_CODE_MAP.get(reason_code, 5)
-    return mapped_reason_int, reason_text
-
-
-def prompt_total_reports():
-    while True:
-        report_input = input(f"Total Reports to send (Default {DEFAULT_REPORT_COUNT}): ").strip()
-        if not report_input:
-            return DEFAULT_REPORT_COUNT
-        try:
-            total_reports = int(report_input)
-            if total_reports > 0:
-                return total_reports
-            print("Number must be greater than 0.")
-        except ValueError:
-            print("Invalid number entered.")
-
-
-def print_summary(start_time: datetime.datetime):
-    end_time = datetime.datetime.now()
-    print("\n" + "=" * 40)
-    print("✅ PROCESS FINISHED")
-    print("=" * 40)
-    print(f"Total Sent  : {TOTAL_SENT}")
-    print(f"Duration    : {end_time - start_time}")
-    print("=" * 40)
-
-
-async def run():
-    print("\n--- OxyReport (Ultimate Multi-Target Mode) ---")
-    print(f"--- Developer: {DEVELOPER_SIGNATURE} ---\n")
-
-    print("--- Login Configuration ---")
-    api_id, api_hash = prompt_api_credentials()
-
-    sessions = prompt_sessions()
-    if not sessions:
-        print("No active sessions. Exiting.")
-        return
-
-    active_clients: List[Client] = []
-    print(f"\nLogging in {len(sessions)} sessions...")
-
-    for idx, sess_str in enumerate(sessions):
-        session_name = f"{DEVELOPER_SIGNATURE}_sess_{idx}"
-        try:
-            client = Client(
-                name=session_name,
-                api_id=api_id,
-                api_hash=api_hash,
-                session_string=sess_str,
-                in_memory=True,
-                no_updates=True,
-            )
-            await client.start()
-            active_clients.append(client)
-            print(f"✅ Session {session_name} connected.")
-        except SessionPasswordNeeded:
-            print(f"❌ Session {session_name} Failed: Requires 2FA password.")
-        except Exception as exc:
-            print(f"❌ Session {session_name} Failed: {exc}")
-
-    if not active_clients:
-        print("No active sessions could be started. Exiting.")
-        return
-
-    target_urls = await prompt_targets(active_clients)
-    if not target_urls:
-        print("No valid targets provided. Exiting.")
-        stop_tasks = [c.stop() for c in active_clients]
-        await asyncio.gather(*stop_tasks, return_exceptions=True)
-        return
-
-    print("\nVerifying all targets...")
-    valid_targets: List[Dict[str, object]] = []
-    for target in target_urls:
-        if await verify_target(active_clients[0], target):
-            valid_targets.append(target)
-            print(f"✅ Valid: {target['entity_id']}")
-        else:
-            print(f"❌ Invalid: {target['entity_id']} (Skipping)")
-
-    if not valid_targets:
-        print("All targets failed verification. Exiting.")
-        stop_tasks = [c.stop() for c in active_clients]
-        await asyncio.gather(*stop_tasks, return_exceptions=True)
-        return
-
-    reason_int, reason_text = prompt_reason_and_description()
-    total_reports = prompt_total_reports()
-
-    print("Starting concurrent tasks...")
-    start_time = datetime.datetime.now()
-
-    tasks = [
-        asyncio.create_task(
-            multi_target_report_worker(
-                client,
-                valid_targets,
-                reason_int,
-                reason_text,
-                total_reports,
-                f"{DEVELOPER_SIGNATURE}_Worker-{i + 1}",
-            )
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "UserPreferences":
+        return cls(
+            auto_reply=payload.get("auto_reply", True),
+            moderation_enabled=payload.get("moderation_enabled", True),
         )
-        for i, client in enumerate(active_clients)
+
+
+@dataclass
+class AuditEntry:
+    """Structured audit log entry for user actions."""
+
+    user_id: int
+    action: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"user_id": self.user_id, "action": self.action, "meta": self.meta}
+
+
+def ensure_data_files() -> None:
+    """Create data directory and seed JSON stores if missing."""
+
+    DATA_DIR.mkdir(exist_ok=True)
+    if not PREFS_FILE.exists():
+        PREFS_FILE.write_text(json.dumps({}, indent=2))
+    if not AUDIT_FILE.exists():
+        AUDIT_FILE.write_text(json.dumps([], indent=2))
+
+
+def load_preferences(user_id: int) -> UserPreferences:
+    """Read user preferences from disk, falling back to defaults."""
+
+    ensure_data_files()
+    payload = json.loads(PREFS_FILE.read_text())
+    prefs = payload.get(str(user_id), {})
+    return UserPreferences.from_dict(prefs)
+
+
+def save_preferences(user_id: int, prefs: UserPreferences) -> None:
+    """Persist user preferences to disk."""
+
+    ensure_data_files()
+    payload = json.loads(PREFS_FILE.read_text())
+    payload[str(user_id)] = prefs.to_dict()
+    PREFS_FILE.write_text(json.dumps(payload, indent=2))
+
+
+def append_audit(entry: AuditEntry) -> None:
+    """Append an audit entry, trimming the log to a manageable size."""
+
+    ensure_data_files()
+    log_payload: List[Dict[str, Any]] = json.loads(AUDIT_FILE.read_text())
+    log_payload.append(entry.to_dict())
+    # Keep the newest 200 entries to avoid unbounded growth
+    trimmed = log_payload[-200:]
+    AUDIT_FILE.write_text(json.dumps(trimmed, indent=2))
+
+
+def log_action(action: str) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
+    """Decorator to log handler execution and capture errors."""
+
+    def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            user_id = update.effective_user.id if update.effective_user else 0
+            logging.info("Action %s by user %s", action, user_id)
+            append_audit(
+                AuditEntry(
+                    user_id=user_id,
+                    action=action,
+                    meta={"chat": update.effective_chat.id if update.effective_chat else None},
+                )
+            )
+            try:
+                return await func(update, context, *args, **kwargs)
+            except Exception:  # pragma: no cover - defensive logging
+                logging.exception("Handler %s failed", func.__name__)
+                await update.effective_message.reply_text(
+                    "⚠️ Something went wrong. The team has been notified.", quote=True
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Help"), KeyboardButton("Support")],
+            [KeyboardButton("Features"), KeyboardButton("Logs")],
+            [KeyboardButton("Settings")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Commands", callback_data="help:commands")],
+            [InlineKeyboardButton("Admin Tools", callback_data="help:admin")],
+            [InlineKeyboardButton("Support", callback_data="help:support")],
+        ]
+    )
+
+
+def settings_keyboard(prefs: UserPreferences) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Auto-Reply: {'On' if prefs.auto_reply else 'Off'}",
+                    callback_data="settings:auto_reply",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Moderation: {'On' if prefs.moderation_enabled else 'Off'}",
+                    callback_data="settings:moderation",
+                )
+            ],
+        ]
+    )
+
+
+@log_action("start")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome users and provide the main navigation keyboard."""
+
+    user = update.effective_user
+    prefs = load_preferences(user.id)
+    welcome = (
+        "👋 Welcome to the Reaction Assistant!\n"
+        "Navigate with the menu below to explore help, support, and admin tools."
+    )
+
+    inline = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Open Help", callback_data="help:commands")],
+            [InlineKeyboardButton("Contact Support", url="https://t.me/your_support_handle")],
+        ]
+    )
+
+    await update.effective_message.reply_text(
+        welcome,
+        reply_markup=main_menu_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await update.effective_message.reply_text(
+        "Quick actions:", reply_markup=inline, parse_mode=ParseMode.MARKDOWN
+    )
+    save_preferences(user.id, prefs)
+
+
+@log_action("help")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "🤖 *Help Center*\n"
+        "Use the buttons to navigate through the available topics."
+    )
+    await update.effective_message.reply_text(
+        text, reply_markup=help_keyboard(), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@log_action("support")
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = (
+        "📞 *Support Desk*\n"
+        "Reach out to the developer or join the community channel for updates."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Chat with Developer", url="https://t.me/your_handle")],
+            [InlineKeyboardButton("Community Channel", url="https://t.me/your_channel")],
+        ]
+    )
+    await update.effective_message.reply_text(
+        message, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@log_action("features")
+async def features_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "✨ *Feature Overview*\n"
+        "- Rich inline + reply keyboards\n"
+        "- Inline query shortcuts\n"
+        "- Auto-replies & moderation\n"
+        "- Admin-only commands with audit logging\n"
+        "- Persistent JSON storage for user preferences and logs"
+    )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@log_action("logs")
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Recent Activity", callback_data="logs:recent")],
+            [InlineKeyboardButton("Bot Status", callback_data="logs:status")],
+        ]
+    )
+    await update.effective_message.reply_text(
+        "📊 Choose what you want to inspect.", reply_markup=keyboard
+    )
+
+
+async def send_recent_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not is_admin(user_id):
+        await update.effective_message.reply_text("Only admins can view audit entries.")
+        return
+
+    entries: List[Dict[str, Any]] = json.loads(AUDIT_FILE.read_text())[-10:]
+    if not entries:
+        await update.effective_message.reply_text("No audit entries yet.")
+        return
+
+    lines = [f"• {entry['action']} by {entry['user_id']}" for entry in entries]
+    await update.effective_message.reply_text("Recent logs:\n" + "\n".join(lines))
+
+
+async def send_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    entries: List[Dict[str, Any]] = json.loads(AUDIT_FILE.read_text())
+    unique_users: Iterable[int] = {entry.get("user_id", 0) for entry in entries}
+    stats = (
+        f"🛰️ *Bot Status*\n"
+        f"Tracked actions: {len(entries)}\n"
+        f"Unique users: {len(unique_users)}\n"
+        f"Admins: {len(ADMIN_USER_IDS)}"
+    )
+    await update.effective_message.reply_text(stats, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_logs_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "logs:recent":
+        await send_recent_logs(update, context)
+    elif query.data == "logs:status":
+        await send_status(update, context)
+
+
+async def handle_help_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    messages = {
+        "help:commands": (
+            "\n".join(
+                [
+                    "🛠️ *User Commands*:",
+                    "/start – open the main menu",
+                    "/help – open this help center",
+                    "/support – reach the developer",
+                    "/features – discover capabilities",
+                    "/logs – view status and audit info",
+                    "/settings – update your preferences",
+                ]
+            )
+        ),
+        "help:admin": (
+            "\n".join(
+                [
+                    "🛡️ *Admin Commands*:",
+                    "/login – verify admin identity",
+                    "/report – file a report to the team",
+                    "/link – fetch integration links",
+                ]
+            )
+        ),
+        "help:support": (
+            "\n".join(
+                [
+                    "☎️ *Support Options*:",
+                    "- DM the developer",
+                    "- Join the community channel",
+                    "- Use inline queries for quick answers",
+                ]
+            )
+        ),
+    }
+
+    response = messages.get(query.data, "Select a topic from the menu.")
+    await query.edit_message_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=help_keyboard())
+
+
+@log_action("settings")
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    prefs = load_preferences(update.effective_user.id)
+    await update.effective_message.reply_text(
+        "⚙️ Settings", reply_markup=settings_keyboard(prefs), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id if update.effective_user else 0
+    prefs = load_preferences(user_id)
+
+    if query.data == "settings:auto_reply":
+        prefs.auto_reply = not prefs.auto_reply
+    elif query.data == "settings:moderation":
+        prefs.moderation_enabled = not prefs.moderation_enabled
+
+    save_preferences(user_id, prefs)
+    await query.edit_message_reply_markup(reply_markup=settings_keyboard(prefs))
+
+
+async def require_admin(update: Update) -> bool:
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not is_admin(user_id):
+        await update.effective_message.reply_text("This command is reserved for admins.")
+        return False
+    return True
+
+
+@log_action("admin_login")
+async def admin_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    await update.effective_message.reply_text("✅ Admin identity confirmed. Welcome back!")
+
+
+@log_action("admin_report")
+async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    issue = " ".join(context.args) if context.args else "(no summary provided)"
+    append_audit(
+        AuditEntry(user_id=update.effective_user.id, action="admin_report", meta={"issue": issue})
+    )
+    await update.effective_message.reply_text(
+        "📝 Report recorded. The team will review it shortly."
+    )
+
+
+@log_action("admin_link")
+async def admin_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    await update.effective_message.reply_text(
+        "🔗 Admin integrations:\n- Dashboard: https://example.com/admin\n- API Docs: https://example.com/docs"
+    )
+
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query
+    prompt = query.query or "Reaction bot"
+
+    results = [
+        InlineQueryResultArticle(
+            id="help",
+            title="Help Center",
+            description="Open the bot's help menu",
+            input_message_content=InputTextMessageContent(
+                "Use /help to explore commands and admin tools."
+            ),
+        ),
+        InlineQueryResultArticle(
+            id="support",
+            title="Support Links",
+            description="Contact the developer or join the channel",
+            input_message_content=InputTextMessageContent(
+                "Need assistance? Ping @your_handle or join https://t.me/your_channel"
+            ),
+        ),
+        InlineQueryResultArticle(
+            id="echo",
+            title="Echo Prompt",
+            description="Send your text back with markdown styling",
+            input_message_content=InputTextMessageContent(
+                f"*You said:* {prompt}", parse_mode=ParseMode.MARKDOWN
+            ),
+        ),
     ]
 
-    try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    except KeyboardInterrupt:
-        print("\nProcess manually stopped by user.")
-        STOP_EVENT.set()
-    except Exception as exc:
-        print(f"An unexpected error occurred during task gathering: {exc}")
-        STOP_EVENT.set()
-    finally:
-        print("Initiating final cleanup and task cancellation...")
-        pending_tasks = [t for t in tasks if not t.done()]
-        if pending_tasks:
-            for task in pending_tasks:
-                task.cancel()
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+    await query.answer(results, cache_time=0)
 
-        print_summary(start_time)
 
-        print("Stopping sessions concurrently...")
-        stop_tasks = [c.stop() for c in active_clients]
-        await asyncio.gather(*stop_tasks, return_exceptions=True)
-        print("Goodbye.")
+async def auto_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-respond to common prompts and perform light moderation."""
+
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else 0
+    prefs = load_preferences(user_id)
+    text = message.text or ""
+    lowered = text.lower()
+
+    banned_keywords = {"spam", "scam", "abuse"}
+    if prefs.moderation_enabled and any(word in lowered for word in banned_keywords):
+        await message.reply_text(
+            "🚫 Your message triggers moderation filters. Please keep the chat professional."
+        )
+        append_audit(AuditEntry(user_id=user_id, action="moderation_flag", meta={"text": text}))
+        return
+
+    if prefs.auto_reply:
+        quick_replies = {
+            "hello": "Hello! Tap *Help* to see what I can do.",
+            "support": "Need help? Use /support or try inline: @YourBot support",
+            "settings": "Use /settings to update preferences.",
+            "help": "Use /help to open the interactive help center.",
+            "features": "Use /features to see everything I can do.",
+        }
+        for keyword, reply in quick_replies.items():
+            if keyword in lowered:
+                await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+                return
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Update %s caused error", update, exc_info=context.error)
+
+
+def getenv_token() -> str | None:
+    return os.environ.get("BOT_TOKEN")
+
+
+def build_application() -> Application:
+    token_files = [Path(".env"), Path(".token")]
+    token_from_file = None
+    for token_file in token_files:
+        if token_file.exists():
+            token_from_file = token_file.read_text().strip()
+            break
+
+    token = getenv_token() or token_from_file
+    if not token:
+        raise RuntimeError("BOT_TOKEN is required. Set the environment variable before running.")
+
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .rate_limiter(AIORateLimiter())
+        .concurrent_updates(True)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("support", support_command))
+    application.add_handler(CommandHandler("features", features_command))
+    application.add_handler(CommandHandler("logs", logs_command))
+    application.add_handler(CommandHandler("settings", settings_command))
+
+    application.add_handler(CommandHandler("login", admin_login))
+    application.add_handler(CommandHandler("report", admin_report))
+    application.add_handler(CommandHandler("link", admin_link))
+
+    application.add_handler(CallbackQueryHandler(handle_help_callbacks, pattern=r"^help:"))
+    application.add_handler(CallbackQueryHandler(handle_logs_callbacks, pattern=r"^logs:"))
+    application.add_handler(CallbackQueryHandler(handle_settings_callbacks, pattern=r"^settings:"))
+
+    application.add_handler(InlineQueryHandler(inline_query_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_response))
+
+    application.add_error_handler(error_handler)
+    return application
+
+
+async def run_bot() -> None:
+    ensure_data_files()
+    app = build_application()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    logging.info("Bot started successfully.")
+    await app.updater.idle()
+    await app.stop()
+    await app.shutdown()
 
 
 if __name__ == "__main__":
+    ensure_data_files()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
+    )
+
     try:
-        asyncio.run(run())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
-        print("\nProgram exit initiated.")
-        sys.exit(0)
+        logging.info("Bot stopped by user.")
