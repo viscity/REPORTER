@@ -266,8 +266,8 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    saved_api_id = context.user_data.get("saved_api_id")
-    saved_api_hash = context.user_data.get("saved_api_hash")
+    saved_api_id = context.user_data.get("saved_api_id") or config.API_ID
+    saved_api_hash = context.user_data.get("saved_api_hash") or config.API_HASH
     saved_sessions = context.user_data.get("saved_sessions")
     if saved_sessions is None:
         saved_sessions = await data_store.get_sessions()
