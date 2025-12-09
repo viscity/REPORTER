@@ -506,19 +506,27 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     api_hash = job_data.get("api_hash")
     reason_code = job_data.get("reason_code", 5)
 
-    started = datetime.now(timezone.utc)
     await context.bot.send_message(chat_id=chat_id, text="Preparing clients...")
 
     messages = []
 
     for target in targets:
-        summary = await perform_reporting(target, reasons, count, sessions, api_id=api_id, api_hash=api_hash, reason_code=reason_code)
+        started = datetime.now(timezone.utc)
+        try:
+            summary = await perform_reporting(
+                target, reasons, count, sessions, api_id=api_id, api_hash=api_hash, reason_code=reason_code
+            )
+        except Exception as exc:  # pragma: no cover - runtime safety
+            logging.exception("Failed to complete reporting job")
+            summary = {"success": 0, "failed": 0, "halted": True, "error": str(exc)}
+
         ended = datetime.now(timezone.utc)
+        sessions_used = summary.get("sessions_started", len(sessions))
         text = (
             f"Target: {target}\n"
             f"Reasons: {', '.join(reasons)}\n"
             f"Requested: {count}\n"
-            f"Sessions used: {len(sessions)}\n"
+            f"Sessions used: {sessions_used}\n"
             f"Success: {summary['success']} | Failed: {summary['failed']}\n"
             f"Stopped early: {'Yes' if summary.get('halted') else 'No'}\n"
             f"Error: {summary.get('error', 'None')}\n"
@@ -533,7 +541,7 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
                 "target": target,
                 "reasons": reasons,
                 "requested": count,
-                "sessions": len(sessions),
+                "sessions": sessions_used,
                 "success": summary["success"],
                 "failed": summary["failed"],
                 "started_at": started,
@@ -571,23 +579,28 @@ async def perform_reporting(
         api_id = config.API_ID
         api_hash = config.API_HASH
 
-    clients = [
-        Client(
+    clients: list[Client] = []
+    failed_sessions = 0
+    for idx, session in enumerate(sessions):
+        client = Client(
             name=f"reporter_{idx}",
             api_id=api_id,
             api_hash=api_hash,
             session_string=session,
             workdir=f"/tmp/report_session_{idx}",
         )
-        for idx, session in enumerate(sessions)
-    ]
+        try:
+            await client.start()
+            clients.append(client)
+        except Exception:
+            failed_sessions += 1
+
+    if not clients:
+        return {"success": 0, "failed": 0, "halted": True, "error": "No sessions could be started"}
 
     reason_text = "; ".join(reasons)[:512] or "No reason provided"
 
     try:
-        for client in clients:
-            await client.start()
-
         try:
             chat_id = await resolve_chat_id(clients[0], target)
         except (BadRequest, RPCError) as exc:
@@ -620,9 +633,22 @@ async def perform_reporting(
             queue.put_nowait(clients[_ % len(clients)])
 
         async def worker() -> None:
-            nonlocal success, failed
-            while not queue.empty():
-                client = await queue.get()
+            nonlocal success, failed, halted
+            while True:
+                if halted:
+                    while not queue.empty():
+                        try:
+                            queue.get_nowait()
+                            queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    break
+
+                try:
+                    client = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
                 result = await report_once(client)
                 if result:
                     success += 1
@@ -634,7 +660,13 @@ async def perform_reporting(
         await queue.join()
         await asyncio.gather(*workers)
 
-        return {"success": success, "failed": failed, "halted": halted}
+        return {
+            "success": success,
+            "failed": failed,
+            "halted": halted,
+            "sessions_started": len(clients),
+            "sessions_failed": failed_sessions,
+        }
 
     finally:
         for client in clients:
