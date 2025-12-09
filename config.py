@@ -12,12 +12,12 @@ from typing import Final
 #  🔴 FILL THESE VALUES CAREFULLY BEFORE DEPLOYMENT
 # -----------------------------------------------------------
 
-BOT_TOKEN: Final[str] = "ENTER_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN: Final[str] = "8436931770:AAF1Wj0UzsLUrTMLA3hCXp1IrPg2IYDdVu0"
 
-API_ID: Final[int] = 1234567        # ← Enter your API ID (integer)
-API_HASH: Final[str] = "ENTER_YOUR_API_HASH_HERE"
+API_ID: Final[int] = 27989579        # ← Enter your API ID (integer)
+API_HASH: Final[str] = "64742ebe270a7d202150134d66397839"
 
-MONGO_URI: Final[str] = "ENTER_YOUR_MONGODB_URI_HERE"
+MONGO_URI: Final[str] = "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mongodb.net/?retryWrites=true&w=majority&appName=AnnieRE"
 
 # -----------------------------------------------------------
 #  (Optional) Author Verification — keep or remove as needed
