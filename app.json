@@ -1,8 +1,8 @@
 {
-  "name": "Reaction Reporter Bot",
+  "name": "Reporter Bot",
   "description": "Telegram reporting bot using Pyrogram with multi-session support and guided inline UI.",
   "keywords": ["telegram", "bot", "pyrogram", "report", "heroku"],
-  "repository": "https://github.com/viscity/reporter",
+  "repository": "https://github.com/viscity/REPORTER",
   "env": {
     "BOT_TOKEN": {
       "description": "Telegram bot token from @BotFather.",
@@ -24,7 +24,7 @@
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "free"
+      "size": "eco"
     }
   },
   "stack": "heroku-22"
