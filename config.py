@@ -12,7 +12,7 @@ from typing import Final
 #  🔴 FILL THESE VALUES CAREFULLY BEFORE DEPLOYMENT
 # -----------------------------------------------------------
 
-BOT_TOKEN: Final[str] = "8562607806:AAE6MS_t67QttcJbPoHPJaftZ20qzpoIQ2c"
+BOT_TOKEN: Final[str] = "7660625546:AAF4jdKG4RZFBmPv9sdvW_CrOC_jMpS6p8s"
 
 API_ID: Final[int] = 27989579        # ← Enter your API ID (integer)
 API_HASH: Final[str] = "64742ebe270a7d202150134d66397839"
@@ -23,5 +23,5 @@ MONGO_URI: Final[str] = "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mo
 #  (Optional) Author Verification — keep or remove as needed
 # -----------------------------------------------------------
 
-AUTHOR_NAME: Final[str] = "oxeign"
+AUTHOR_NAME: Final[str] = "CommunityProtector"
 AUTHOR_HASH: Final[str] = "c5c8cd48384b065a0e46d27016b4e3ea5c9a52bd12d87cd681bd426c480cce3a"
