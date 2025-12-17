@@ -1,4 +1,4 @@
-# Reaction Reporter Bot
+# Reporter Bot
 
 This project provides a Telegram bot that coordinates multiple Pyrogram session strings to submit reports against profiles, groups, channels, or stories. The bot ships with a premium, dark-themed chat UI with clear buttons and guardrails for every step.
 
@@ -72,14 +72,11 @@ python main.py
    ```
 4. Run `python main.py`. Ensure the Replit always-on/uptime solution is enabled if needed.
 
-## Running on Heroku
-1. Create a Heroku app and attach a MongoDB add-on (optional but recommended).
-2. Set Config Vars: `BOT_TOKEN`, `API_ID`, `API_HASH`, and `MONGO_URI` (if available).
-3. Add a `Procfile` entry like:
-   ```
-   worker: python main.py
-   ```
-4. Deploy the repository. Scale the worker dyno: `heroku ps:scale worker=1`.
+Use the one-click button after forking the repository (update <your-username> in the URL to match your GitHub handle):
+
+Deploy
+
+The app.json file configures the worker process and required config vars so Heroku can provision the app automatically.
 
 ## Bot commands
 - `/start` – open the control panel.
