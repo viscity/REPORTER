@@ -1,4 +1,4 @@
-# Reporter Bot
+# Reaction Reporter Bot
 
 This project provides a Telegram bot that coordinates multiple Pyrogram session strings to submit reports against profiles, groups, channels, or stories. The bot ships with a premium, dark-themed chat UI with clear buttons and guardrails for every step.
 
@@ -17,6 +17,13 @@ This project provides a Telegram bot that coordinates multiple Pyrogram session 
 - Telegram API ID and API Hash (https://my.telegram.org)
 - MongoDB connection string (optional but recommended for session persistence)
 - Dependencies from `requirements.txt`
+
+## Deploy to Heroku
+Use the one-click button after forking the repository (update `<your-username>` in the URL to match your GitHub handle):
+
+[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/viscity/reporter)
+
+The `app.json` file configures the worker process and required config vars so Heroku can provision the app automatically.
 
 ## Environment variables
 Set these before running the bot (or edit `config.py` to source them another way):
@@ -72,18 +79,28 @@ python main.py
    ```
 4. Run `python main.py`. Ensure the Replit always-on/uptime solution is enabled if needed.
 
-## Deploy to Heroku
-Use the one-click button after forking the repository (update `<your-username>` in the URL to match your GitHub handle):
+## Running on Heroku
+1. Create a Heroku app and attach a MongoDB add-on (optional but recommended).
+2. Set Config Vars: `BOT_TOKEN`, `API_ID`, `API_HASH`, and `MONGO_URI` (if available).
+3. Deploy the repository (the included `Procfile` already defines the worker dyno: `worker: python main.py`).
+4. Scale the worker dyno: `heroku ps:scale worker=1`.
+5. Optional: set `ADMIN_IDS` (comma-separated Telegram user IDs) to allow trusted operators to issue `/restart`.
 
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/viscity/Reporter)
-
-The `app.json` file configures the worker process and required config vars so Heroku can provision the app automatically.
+### Reliability tips for Heroku
+- Keep only one worker dyno running to avoid duplicate schedulers and duplicate polling.
+- Disable automatic deploys if you see continuous build/release loops after every commit; instead deploy only known-good revisions.
+- If Telegram connectivity is flaky, the bot now retries with exponential backoff instead of crashing the dyno.
+- Provide a `SOURCE_VERSION`, `HEROKU_RELEASE_VERSION`, or `GIT_REV` config var to surface the running version in `/uptime`.
+- Prefer a Hobby dyno or larger if the free/basic tiers restart too frequently; add a simple Pingdom/Upptime health check against `/ping` to spot issues early.
 
 ## Bot commands
 - `/start` – open the control panel.
 - `/report` – begin a guided report (collects API credentials, sessions, target links, report type, reason, and count).
 - `/addsessions` – store additional session strings.
 - `/sessions` – view saved and currently loaded sessions.
+- `/uptime` – show process uptime, server time, and build/version.
+- `/ping` – measure Telegram round-trip latency with CPU/memory usage.
+- `/restart` – admin-only graceful restart of the worker.
 - `/help` – show usage instructions.
 - `/cancel` – abort the current flow.
 
